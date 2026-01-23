@@ -1,9 +1,13 @@
+using Azure;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using GSProRoundStatsManagerFunctionApp.Models.Stats;
 using GSProRoundStatsManagerFunctionApp.Services;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using System.Globalization;
+using System.Text.Json;
 
 namespace GSProRoundStatsManagerFunctionApp
 {
@@ -11,6 +15,9 @@ namespace GSProRoundStatsManagerFunctionApp
     {
         private readonly ILogger<RoundStatsManager> _logger;
         private readonly ICosmosDbService<RoundStat> _roundStatService;
+
+        private const string JobStateContainerName = "job-state";
+        private const string LastSuccessBlobName = "RoundStatsManager/last-success.json";
 
         public RoundStatsManager(ILogger<RoundStatsManager> logger,
             ICosmosDbService<RoundStat> roundStatService)
@@ -20,7 +27,13 @@ namespace GSProRoundStatsManagerFunctionApp
         }
 
         [Function("RoundStatsManager")]
-        public async Task Run([TimerTrigger("%CRONSchedule%")] TimerInfo myTimer)
+        public async Task Run(
+        #if DEBUG
+            [TimerTrigger("%CRONSchedule%", RunOnStartup = true)]
+        #else
+            [TimerTrigger("%CRONSchedule%")]
+        #endif
+            TimerInfo myTimer)
         {
             // Gets the Calendar instance associated with a CultureInfo.
             CultureInfo cultureInfo = new CultureInfo("en-US");
@@ -31,31 +44,64 @@ namespace GSProRoundStatsManagerFunctionApp
             DayOfWeek firstDOW = cultureInfo.DateTimeFormat.FirstDayOfWeek;
             DateTime dateTime = DateTime.UtcNow;
 
-        int year = dateTime.Year;
+            int year = dateTime.Year;
+            int month = dateTime.Month;
             int week = calendar.GetWeekOfYear(dateTime, weekRule, firstDOW);
+            int day = dateTime.Day;
+
+            // Weekly date range (culture-aware)
+            int diff = (7 + (dateTime.DayOfWeek - firstDOW)) % 7;
+            var startOfWeek = dateTime.Date.AddDays(-diff);
+            var endOfWeek = startOfWeek.AddDays(7);
+
+            // Cursor: read last successful finish time from blob (fallback if missing)
+            DateTime fallbackSinceUtc = dateTime.AddDays(-8);
+            var lastSucceededUtc = await ReadLastSucceededUtcAsync(fallbackSinceUtc);
+
+            // overlap so you don’t miss writes near the boundary
+            int overlapSeconds = 300;
+            var sinceUtc = lastSucceededUtc.AddSeconds(-overlapSeconds);
+            int sinceTs = (int)new DateTimeOffset(sinceUtc).ToUnixTimeSeconds();
+            if (sinceTs < 0) sinceTs = 0;
+
+            _logger.LogInformation($"Cursor: lastSucceededUtc={lastSucceededUtc:o}, sinceUtc={sinceUtc:o}, sinceTs={sinceTs}");
 
             try
             {
                 int roundCountRetention = 10;
-                string roundFileHashQuery = "select c.RoundFileHash, count(1) as RecordCount from c group by c.RoundFileHash"; // where c.RoundFileHash = '134936490905'";
-                var roundFileHashQueryDefinition = new QueryDefinition(roundFileHashQuery);
+
+                // Discover only hashes changed since last success (using _ts)
+                string roundFileHashQuery =
+                    "select distinct c.RoundFileHash " +
+                    "from c " +
+                    "where c._ts >= @sinceTs";
+
+                var roundFileHashQueryDefinition = new QueryDefinition(roundFileHashQuery)
+                    .WithParameter("@sinceTs", sinceTs);
 
                 var roundFileHashList = (await _roundStatService.QueryItemsAsync(roundFileHashQueryDefinition, null))
-                    .Where(r => r.RecordCount > roundCountRetention) // Don't process any RoundFileHash if total records are below roundCountRetention
-                    .OrderBy(r => r.RecordCount)
+                    .Where(r => !string.IsNullOrWhiteSpace(r.RoundFileHash))
                     .Select(r => r.RoundFileHash)
+                    .Distinct()
                     .ToList();
 
-                int roundFileHashRowNum = 0;
                 int roundFileHashTotal = roundFileHashList.Count;
 
-                foreach(var roundFileHash in roundFileHashList)
+                for (int i = 0; i < roundFileHashTotal; i++)
                 {
-                    roundFileHashRowNum = roundFileHashList.IndexOf(roundFileHash) + 1;
+                    var roundFileHash = roundFileHashList[i];
+                    int roundFileHashRowNum = i + 1;
 
                     var rounds = await _roundStatService.ReadFeedAsync(roundFileHash);
+                    var roundsList = rounds as List<RoundStat> ?? rounds.ToList();
 
-                    var allTime = rounds
+                    if (roundsList.Count <= roundCountRetention)
+                    {
+                        _logger.LogInformation($"RoundFileHash: {roundFileHash} - ({roundFileHashRowNum}/{roundFileHashTotal}) - skipped (count={roundsList.Count})");
+                        continue;
+                    }
+
+                    var allTime = roundsList
                         .GroupBy(r => new { r.LicenseKey, r.ControlType })
                         .SelectMany(g => g
                             .OrderByDescending(r => r.SkillsScore)
@@ -63,9 +109,9 @@ namespace GSProRoundStatsManagerFunctionApp
                             .Take(roundCountRetention))
                         .ToList();
 
-                    var monthly = rounds
-                        .Where(s => s.DateModified.Year == dateTime.Year &&
-                                    s.DateModified.Month == dateTime.Month)
+                    var monthly = roundsList
+                        .Where(s => s.DateModified.Year == year &&
+                                    s.DateModified.Month == month)
                         .GroupBy(r => new { r.LicenseKey, r.ControlType })
                         .SelectMany(g => g
                             .OrderByDescending(r => r.SkillsScore)
@@ -73,9 +119,8 @@ namespace GSProRoundStatsManagerFunctionApp
                             .Take(roundCountRetention))
                         .ToList();
 
-                    var weekly = rounds
-                        .Where(s => s.DateModified.Year == dateTime.Year &&
-                                    calendar.GetWeekOfYear(s.DateModified, weekRule, firstDOW) == calendar.GetWeekOfYear(dateTime, weekRule, firstDOW))
+                    var weekly = roundsList
+                        .Where(s => s.DateModified >= startOfWeek && s.DateModified < endOfWeek)
                         .GroupBy(r => new { r.LicenseKey, r.ControlType })
                         .SelectMany(g => g
                             .OrderByDescending(r => r.SkillsScore)
@@ -83,10 +128,10 @@ namespace GSProRoundStatsManagerFunctionApp
                             .Take(roundCountRetention))
                         .ToList();
 
-                    var daily = rounds
-                        .Where(s => s.DateModified.Year == dateTime.Year &&
-                                    s.DateModified.Month == dateTime.Month &&
-                                    s.DateModified.Day == dateTime.Day)
+                    var daily = roundsList
+                        .Where(s => s.DateModified.Year == year &&
+                                    s.DateModified.Month == month &&
+                                    s.DateModified.Day == day)
                         .GroupBy(r => new { r.LicenseKey, r.ControlType })
                         .SelectMany(g => g
                             .OrderByDescending(r => r.SkillsScore)
@@ -94,20 +139,15 @@ namespace GSProRoundStatsManagerFunctionApp
                             .Take(roundCountRetention))
                         .ToList();
 
-                    // Combine top rounds from all periods
                     var combinedTopRounds = allTime
                         .Concat(monthly)
                         .Concat(weekly)
                         .Concat(daily)
                         .Select(r => r.id)
-                        .Distinct()
-                        .ToList();
+                        .ToHashSet();
 
-                    // Find all rows that don't fit into the top rounds criteria
-                    var nonTopRounds = rounds
+                    var nonTopRounds = roundsList
                         .Where(r => !combinedTopRounds.Contains(r.id))
-                        .OrderByDescending(r => r.SkillsScore)
-                        .ThenByDescending(r => r.DateModified)
                         .ToList();
 
                     // Output results or further processing
@@ -123,13 +163,75 @@ namespace GSProRoundStatsManagerFunctionApp
                         await _roundStatService.DeleteItemsInParallelAsync(nonTopRounds);
                     }
                 }
+
+                // Only set cursor AFTER success
+                await WriteLastSucceededUtcAsync(DateTime.UtcNow);
+
+                _logger.LogInformation($"Completed at: {DateTime.UtcNow:o}");
             }
             catch (Exception ex)
             {
                 _logger.LogInformation(ex.Message);
             }
+        }
 
-            _logger.LogInformation($"Completed at: {DateTime.UtcNow}");
+        private static BlobClient GetLastSuccessBlobClient()
+        {
+            string storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
+            var blobServiceClient = new BlobServiceClient(storageConnectionString);
+            var containerClient = blobServiceClient.GetBlobContainerClient(JobStateContainerName);
+            containerClient.CreateIfNotExists(PublicAccessType.None);
+            return containerClient.GetBlobClient(LastSuccessBlobName);
+        }
+
+        private async Task<DateTime> ReadLastSucceededUtcAsync(DateTime fallbackUtc)
+        {
+            try
+            {
+                var blobClient = GetLastSuccessBlobClient();
+
+                if (!await blobClient.ExistsAsync())
+                {
+                    return fallbackUtc;
+                }
+
+                var download = await blobClient.DownloadContentAsync();
+                var json = download.Value.Content.ToString();
+
+                var state = JsonSerializer.Deserialize<JobState>(json);
+                if (state == null || state.LastSucceededUtc == default)
+                {
+                    return fallbackUtc;
+                }
+
+                return DateTime.SpecifyKind(state.LastSucceededUtc, DateTimeKind.Utc);
+            }
+            catch
+            {
+                return fallbackUtc;
+            }
+        }
+
+        private async Task WriteLastSucceededUtcAsync(DateTime finishedUtc)
+        {
+            var blobClient = GetLastSuccessBlobClient();
+
+            var state = new JobState
+            {
+                LastSucceededUtc = finishedUtc,
+                LastSucceededTs = (long)new DateTimeOffset(finishedUtc).ToUnixTimeSeconds()
+            };
+
+            var json = JsonSerializer.Serialize(state);
+
+            // overwrite marker on each successful run
+            await blobClient.UploadAsync(BinaryData.FromString(json), overwrite: true);
+        }
+
+        private class JobState
+        {
+            public DateTime LastSucceededUtc { get; set; }
+            public long LastSucceededTs { get; set; }
         }
     }
 }

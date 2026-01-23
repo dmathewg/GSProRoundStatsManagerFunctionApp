@@ -285,10 +285,9 @@ namespace GSProRoundStatsManagerFunctionApp.Services
             services.AddSingleton(s => new CosmosClient(cosmosDbOptions.Endpoint, cosmosDbOptions.PrimaryKey,
                 new CosmosClientOptions
                 {
-                    SerializerOptions = new CosmosSerializationOptions()
-                    {
-                        IgnoreNullValues = true
-                    }
+                    ConnectionMode = ConnectionMode.Direct,
+                    SerializerOptions = new CosmosSerializationOptions { IgnoreNullValues = true },
+                    ApplicationName = "GSProRoundStatsManagerFunctionApp"
                 }));
 
             services.AddSingleton<ICosmosDbService<RoundStat>>(s => new CosmosDbService<RoundStat>(
