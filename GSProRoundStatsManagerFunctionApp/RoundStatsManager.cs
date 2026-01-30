@@ -28,7 +28,7 @@ namespace GSProRoundStatsManagerFunctionApp
 
         [Function("RoundStatsManager")]
         public async Task Run(
-        #if DEBUG
+#if DEBUG
             [TimerTrigger("%CRONSchedule%", RunOnStartup = true)]
         #else
             [TimerTrigger("%CRONSchedule%")]
@@ -175,12 +175,21 @@ namespace GSProRoundStatsManagerFunctionApp
             }
         }
 
-        private static BlobClient GetLastSuccessBlobClient()
+        private static async Task<BlobClient> GetLastSuccessBlobClientAsync()
         {
             string storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
             var blobServiceClient = new BlobServiceClient(storageConnectionString);
             var containerClient = blobServiceClient.GetBlobContainerClient(JobStateContainerName);
-            containerClient.CreateIfNotExists(PublicAccessType.None);
+
+            try
+            {
+                await containerClient.CreateIfNotExistsAsync(PublicAccessType.None);
+            }
+            catch (RequestFailedException ex) when (ex.Status == 409)
+            {
+                // Another instance created the container at the same time.
+            }
+
             return containerClient.GetBlobClient(LastSuccessBlobName);
         }
 
@@ -188,7 +197,7 @@ namespace GSProRoundStatsManagerFunctionApp
         {
             try
             {
-                var blobClient = GetLastSuccessBlobClient();
+                var blobClient = await GetLastSuccessBlobClientAsync();
 
                 if (!await blobClient.ExistsAsync())
                 {
@@ -214,7 +223,7 @@ namespace GSProRoundStatsManagerFunctionApp
 
         private async Task WriteLastSucceededUtcAsync(DateTime finishedUtc)
         {
-            var blobClient = GetLastSuccessBlobClient();
+            var blobClient = await GetLastSuccessBlobClientAsync();
 
             var state = new JobState
             {
