@@ -1,4 +1,5 @@
-﻿using GSProRoundStatsManagerFunctionApp.ConfigurationOptions;
+﻿using Azure.Identity;
+using GSProRoundStatsManagerFunctionApp.ConfigurationOptions;
 using GSProRoundStatsManagerFunctionApp.Models.Stats;
 using Microsoft.Azure.Cosmos;
 using Microsoft.Azure.Cosmos.Linq;
@@ -281,8 +282,8 @@ namespace GSProRoundStatsManagerFunctionApp.Services
     {
         public static void AddCosmosDbServices(this IServiceCollection services, CosmosDbOptions cosmosDbOptions)
         {
-            // Register CosmosClient as a singleton
-            services.AddSingleton(s => new CosmosClient(cosmosDbOptions.Endpoint, cosmosDbOptions.PrimaryKey,
+            // Register CosmosClient as a singleton using RBAC (DefaultAzureCredential)
+            services.AddSingleton(s => new CosmosClient(cosmosDbOptions.Endpoint, new DefaultAzureCredential(),
                 new CosmosClientOptions
                 {
                     ConnectionMode = ConnectionMode.Direct,
