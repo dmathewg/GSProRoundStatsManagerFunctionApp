@@ -1,6 +1,4 @@
-using Azure;
 using Azure.Storage.Blobs;
-using Azure.Storage.Blobs.Models;
 using GSProRoundStatsManagerFunctionApp.Models.Stats;
 using GSProRoundStatsManagerFunctionApp.Services;
 using Microsoft.Azure.Cosmos;
@@ -19,6 +17,20 @@ namespace GSProRoundStatsManagerFunctionApp
         private const string JobStateContainerName = "job-state";
         private const string LastSuccessBlobName = "RoundStatsManager/last-success.json";
 
+        // Each hash is an independent partition, so these fan out cleanly. 8 keeps the
+        // in-flight reads well under the Cosmos write limiter and leaves RU headroom
+        // for the deletes each iteration kicks off.
+        private const int MaxParallelHashes = 8;
+
+        // Container is provisioned outside this app, so no CreateIfNotExists call.
+        // Built once per process and reused across invocations. PublicationOnly so a
+        // transient failure at first access isn't cached for the life of the process.
+        private static readonly Lazy<BlobClient> _lastSuccessBlobClient = new(() =>
+            new BlobServiceClient(Environment.GetEnvironmentVariable("AzureWebJobsStorage"))
+                .GetBlobContainerClient(JobStateContainerName)
+                .GetBlobClient(LastSuccessBlobName),
+            LazyThreadSafetyMode.PublicationOnly);
+
         public RoundStatsManager(ILogger<RoundStatsManager> logger,
             ICosmosDbService<RoundStat> roundStatService)
         {
@@ -35,18 +47,13 @@ namespace GSProRoundStatsManagerFunctionApp
         #endif
             TimerInfo myTimer)
         {
-            // Gets the Calendar instance associated with a CultureInfo.
+            // Gets the CultureInfo used to determine the first day of the week.
             CultureInfo cultureInfo = new CultureInfo("en-US");
-            Calendar calendar = cultureInfo.Calendar;
-
-            // Gets the DTFI properties required by GetWeekOfYear.
-            CalendarWeekRule weekRule = cultureInfo.DateTimeFormat.CalendarWeekRule;
             DayOfWeek firstDOW = cultureInfo.DateTimeFormat.FirstDayOfWeek;
             DateTime dateTime = DateTime.UtcNow;
 
             int year = dateTime.Year;
             int month = dateTime.Month;
-            int week = calendar.GetWeekOfYear(dateTime, weekRule, firstDOW);
             int day = dateTime.Day;
 
             // Weekly date range (culture-aware)
@@ -86,118 +93,115 @@ namespace GSProRoundStatsManagerFunctionApp
                     .ToList();
 
                 int roundFileHashTotal = roundFileHashList.Count;
+                _logger.LogInformation($"Hash discovery: {roundFileHashTotal} hashes changed since {sinceUtc:o}");
 
-                for (int i = 0; i < roundFileHashTotal; i++)
-                {
-                    var roundFileHash = roundFileHashList[i];
-                    int roundFileHashRowNum = i + 1;
+                // Was a sequential for-loop: one ReadFeedAsync round trip awaited at a time,
+                // so total runtime was roundFileHashTotal x per-read latency. Fanning out
+                // turns that into (total / MaxParallelHashes) x latency.
+                int processed = 0;
+                int skipped = 0;
+                int deletedTotal = 0;
 
-                    var rounds = await _roundStatService.ReadFeedAsync(roundFileHash);
-                    var roundsList = rounds as List<RoundStat> ?? rounds.ToList();
-
-                    if (roundsList.Count <= roundCountRetention)
+                await Parallel.ForEachAsync(
+                    roundFileHashList,
+                    new ParallelOptions { MaxDegreeOfParallelism = MaxParallelHashes },
+                    async (roundFileHash, ct) =>
                     {
-                        _logger.LogInformation($"RoundFileHash: {roundFileHash} - ({roundFileHashRowNum}/{roundFileHashTotal}) - skipped (count={roundsList.Count})");
-                        continue;
-                    }
+                        var rounds = await _roundStatService.ReadFeedAsync(roundFileHash);
+                        var roundsList = rounds as List<RoundStat> ?? rounds.ToList();
 
-                    var allTime = roundsList
-                        .GroupBy(r => new { r.LicenseKey, r.ControlType })
-                        .SelectMany(g => g
-                            .OrderByDescending(r => r.SkillsScore)
-                            .ThenByDescending(r => r.DateModified)
-                            .Take(roundCountRetention))
-                        .ToList();
+                        if (roundsList.Count <= roundCountRetention)
+                        {
+                            Interlocked.Increment(ref skipped);
+                            return;
+                        }
 
-                    var monthly = roundsList
-                        .Where(s => s.DateModified.Year == year &&
-                                    s.DateModified.Month == month)
-                        .GroupBy(r => new { r.LicenseKey, r.ControlType })
-                        .SelectMany(g => g
-                            .OrderByDescending(r => r.SkillsScore)
-                            .ThenByDescending(r => r.DateModified)
-                            .Take(roundCountRetention))
-                        .ToList();
+                        var allTime = roundsList
+                            .GroupBy(r => new { r.LicenseKey, r.ControlType })
+                            .SelectMany(g => g
+                                .OrderByDescending(r => r.SkillsScore)
+                                .ThenByDescending(r => r.DateModified)
+                                .Take(roundCountRetention))
+                            .ToList();
 
-                    var weekly = roundsList
-                        .Where(s => s.DateModified >= startOfWeek && s.DateModified < endOfWeek)
-                        .GroupBy(r => new { r.LicenseKey, r.ControlType })
-                        .SelectMany(g => g
-                            .OrderByDescending(r => r.SkillsScore)
-                            .ThenByDescending(r => r.DateModified)
-                            .Take(roundCountRetention))
-                        .ToList();
+                        var monthly = roundsList
+                            .Where(s => s.DateModified.Year == year &&
+                                        s.DateModified.Month == month)
+                            .GroupBy(r => new { r.LicenseKey, r.ControlType })
+                            .SelectMany(g => g
+                                .OrderByDescending(r => r.SkillsScore)
+                                .ThenByDescending(r => r.DateModified)
+                                .Take(roundCountRetention))
+                            .ToList();
 
-                    var daily = roundsList
-                        .Where(s => s.DateModified.Year == year &&
-                                    s.DateModified.Month == month &&
-                                    s.DateModified.Day == day)
-                        .GroupBy(r => new { r.LicenseKey, r.ControlType })
-                        .SelectMany(g => g
-                            .OrderByDescending(r => r.SkillsScore)
-                            .ThenByDescending(r => r.DateModified)
-                            .Take(roundCountRetention))
-                        .ToList();
+                        var weekly = roundsList
+                            .Where(s => s.DateModified >= startOfWeek && s.DateModified < endOfWeek)
+                            .GroupBy(r => new { r.LicenseKey, r.ControlType })
+                            .SelectMany(g => g
+                                .OrderByDescending(r => r.SkillsScore)
+                                .ThenByDescending(r => r.DateModified)
+                                .Take(roundCountRetention))
+                            .ToList();
 
-                    var combinedTopRounds = allTime
-                        .Concat(monthly)
-                        .Concat(weekly)
-                        .Concat(daily)
-                        .Select(r => r.id)
-                        .ToHashSet();
+                        var daily = roundsList
+                            .Where(s => s.DateModified.Year == year &&
+                                        s.DateModified.Month == month &&
+                                        s.DateModified.Day == day)
+                            .GroupBy(r => new { r.LicenseKey, r.ControlType })
+                            .SelectMany(g => g
+                                .OrderByDescending(r => r.SkillsScore)
+                                .ThenByDescending(r => r.DateModified)
+                                .Take(roundCountRetention))
+                            .ToList();
 
-                    var nonTopRounds = roundsList
-                        .Where(r => !combinedTopRounds.Contains(r.id))
-                        .ToList();
+                        var combinedTopRounds = allTime
+                            .Concat(monthly)
+                            .Concat(weekly)
+                            .Concat(daily)
+                            .Select(r => r.id)
+                            .ToHashSet();
 
-                    // Output results or further processing
-                    _logger.LogInformation($"RoundFileHash: {roundFileHash} - ({roundFileHashRowNum}/{roundFileHashTotal})");
-                    _logger.LogInformation($"\tTop All Time Rounds: {allTime.Count}");
-                    _logger.LogInformation($"\tTop Monthly Rounds: {monthly.Count} ");
-                    _logger.LogInformation($"\tTop Weekly Rounds: {weekly.Count} ");
-                    _logger.LogInformation($"\tTop Daily Rounds: {daily.Count} ");
-                    _logger.LogInformation($"\tNon-Top Rounds: {nonTopRounds.Count}");
+                        var nonTopRounds = roundsList
+                            .Where(r => !combinedTopRounds.Contains(r.id))
+                            .ToList();
 
-                    if (nonTopRounds.Count > 0)
-                    {
-                        await _roundStatService.DeleteItemsInParallelAsync(nonTopRounds);
-                    }
-                }
+                        // Output results or further processing.
+                        // Single line per hash now - interleaved parallel output made the
+                        // old six-line block unreadable, and the counts are all here anyway.
+                        _logger.LogInformation(
+                            "RoundFileHash: {Hash} - rounds={Rounds} allTime={AllTime} monthly={Monthly} weekly={Weekly} daily={Daily} nonTop={NonTop}",
+                            roundFileHash, roundsList.Count, allTime.Count, monthly.Count, weekly.Count, daily.Count, nonTopRounds.Count);
 
-                // Only set cursor AFTER success
-                await WriteLastSucceededUtcAsync(DateTime.UtcNow);
+                        if (nonTopRounds.Count > 0)
+                        {
+                            await _roundStatService.DeleteItemsInParallelAsync(nonTopRounds);
+                            Interlocked.Add(ref deletedTotal, nonTopRounds.Count);
+                        }
+
+                        Interlocked.Increment(ref processed);
+                    });
+
+                _logger.LogInformation(
+                    "Hashes: total={Total} processed={Processed} skipped={Skipped} roundsDeleted={Deleted}",
+                    roundFileHashTotal, processed, skipped, deletedTotal);
+
+                // Only set cursor AFTER success. Use the run's START time so docs written
+                // while the run was in flight aren't skipped on the next tick.
+                await WriteLastSucceededUtcAsync(dateTime);
 
                 _logger.LogInformation($"Completed at: {DateTime.UtcNow:o}");
             }
             catch (Exception ex)
             {
-                _logger.LogInformation(ex.Message);
+                _logger.LogError(ex, "RoundStatsManager run failed; cursor not advanced.");
             }
-        }
-
-        private static async Task<BlobClient> GetLastSuccessBlobClientAsync()
-        {
-            string storageConnectionString = Environment.GetEnvironmentVariable("AzureWebJobsStorage");
-            var blobServiceClient = new BlobServiceClient(storageConnectionString);
-            var containerClient = blobServiceClient.GetBlobContainerClient(JobStateContainerName);
-
-            try
-            {
-                await containerClient.CreateIfNotExistsAsync(PublicAccessType.None);
-            }
-            catch (RequestFailedException ex) when (ex.Status == 409)
-            {
-                // Another instance created the container at the same time.
-            }
-
-            return containerClient.GetBlobClient(LastSuccessBlobName);
         }
 
         private async Task<DateTime> ReadLastSucceededUtcAsync(DateTime fallbackUtc)
         {
             try
             {
-                var blobClient = await GetLastSuccessBlobClientAsync();
+                var blobClient = _lastSuccessBlobClient.Value;
 
                 if (!await blobClient.ExistsAsync())
                 {
@@ -215,15 +219,16 @@ namespace GSProRoundStatsManagerFunctionApp
 
                 return DateTime.SpecifyKind(state.LastSucceededUtc, DateTimeKind.Utc);
             }
-            catch
+            catch (Exception ex)
             {
+                _logger.LogWarning(ex, $"Failed to read cursor blob; falling back to {fallbackUtc:o}");
                 return fallbackUtc;
             }
         }
 
         private async Task WriteLastSucceededUtcAsync(DateTime finishedUtc)
         {
-            var blobClient = await GetLastSuccessBlobClientAsync();
+            var blobClient = _lastSuccessBlobClient.Value;
 
             var state = new JobState
             {
