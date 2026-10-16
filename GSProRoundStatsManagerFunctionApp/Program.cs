@@ -20,7 +20,7 @@ var host = new HostBuilder()
         {
             builder.AddAzureKeyVault(
                 new Uri($"https://{buildConfig["Azure:KeyVaultName"]}.vault.azure.net/"),
-                new ManagedIdentityCredential(),
+                new ManagedIdentityCredential(ManagedIdentityId.SystemAssigned),
                 new KeyVaultSecretManager());
         }
         else

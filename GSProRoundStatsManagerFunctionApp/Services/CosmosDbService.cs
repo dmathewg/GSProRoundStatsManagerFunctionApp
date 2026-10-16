@@ -229,7 +229,7 @@ namespace GSProRoundStatsManagerFunctionApp.Services
 #if DEBUG
             TokenCredential credential = new DefaultAzureCredential();
 #else
-            TokenCredential credential = new ManagedIdentityCredential();
+            TokenCredential credential = new ManagedIdentityCredential(ManagedIdentityId.SystemAssigned);
 #endif
 
             // Register CosmosClient as a singleton using RBAC

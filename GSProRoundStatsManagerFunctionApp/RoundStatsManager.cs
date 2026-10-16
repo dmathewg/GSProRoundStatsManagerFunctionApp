@@ -1,3 +1,4 @@
+using Azure.Identity;
 using Azure.Storage.Blobs;
 using GSProRoundStatsManagerFunctionApp.Models.Stats;
 using GSProRoundStatsManagerFunctionApp.Services;
@@ -25,11 +26,18 @@ namespace GSProRoundStatsManagerFunctionApp
         // Container is provisioned outside this app, so no CreateIfNotExists call.
         // Built once per process and reused across invocations. PublicationOnly so a
         // transient failure at first access isn't cached for the life of the process.
+        // Deployed: identity-based (AzureWebJobsStorage__accountName; Shared Key is disabled
+        // on the account, so a connection string can't work). Local: the Azurite connection
+        // string in local.settings.json.
         private static readonly Lazy<BlobClient> _lastSuccessBlobClient = new(() =>
-            new BlobServiceClient(Environment.GetEnvironmentVariable("AzureWebJobsStorage"))
-                .GetBlobContainerClient(JobStateContainerName)
-                .GetBlobClient(LastSuccessBlobName),
-            LazyThreadSafetyMode.PublicationOnly);
+        {
+            var accountName = Environment.GetEnvironmentVariable("AzureWebJobsStorage__accountName");
+            var service = !string.IsNullOrWhiteSpace(accountName)
+                ? new BlobServiceClient(new Uri($"https://{accountName}.blob.core.windows.net"), new ManagedIdentityCredential(ManagedIdentityId.SystemAssigned))
+                : new BlobServiceClient(Environment.GetEnvironmentVariable("AzureWebJobsStorage"));
+
+            return service.GetBlobContainerClient(JobStateContainerName).GetBlobClient(LastSuccessBlobName);
+        }, LazyThreadSafetyMode.PublicationOnly);
 
         public RoundStatsManager(ILogger<RoundStatsManager> logger,
             ICosmosDbService<RoundStat> roundStatService)
@@ -71,7 +79,8 @@ namespace GSProRoundStatsManagerFunctionApp
             int sinceTs = (int)new DateTimeOffset(sinceUtc).ToUnixTimeSeconds();
             if (sinceTs < 0) sinceTs = 0;
 
-            _logger.LogInformation($"Cursor: lastSucceededUtc={lastSucceededUtc:o}, sinceUtc={sinceUtc:o}, sinceTs={sinceTs}");
+            _logger.LogInformation("Cursor: lastSucceededUtc={LastSucceededUtc:o}, sinceUtc={SinceUtc:o}, sinceTs={SinceTs}",
+                lastSucceededUtc, sinceUtc, sinceTs);
 
             try
             {
@@ -93,7 +102,7 @@ namespace GSProRoundStatsManagerFunctionApp
                     .ToList();
 
                 int roundFileHashTotal = roundFileHashList.Count;
-                _logger.LogInformation($"Hash discovery: {roundFileHashTotal} hashes changed since {sinceUtc:o}");
+                _logger.LogInformation("Hash discovery: {HashCount} hashes changed since {SinceUtc:o}", roundFileHashTotal, sinceUtc);
 
                 // Was a sequential for-loop: one ReadFeedAsync round trip awaited at a time,
                 // so total runtime was roundFileHashTotal x per-read latency. Fanning out
@@ -189,7 +198,7 @@ namespace GSProRoundStatsManagerFunctionApp
                 // while the run was in flight aren't skipped on the next tick.
                 await WriteLastSucceededUtcAsync(dateTime);
 
-                _logger.LogInformation($"Completed at: {DateTime.UtcNow:o}");
+                _logger.LogInformation("Completed at: {CompletedUtc:o}", DateTime.UtcNow);
             }
             catch (Exception ex)
             {
@@ -221,7 +230,7 @@ namespace GSProRoundStatsManagerFunctionApp
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, $"Failed to read cursor blob; falling back to {fallbackUtc:o}");
+                _logger.LogWarning(ex, "Failed to read cursor blob; falling back to {FallbackUtc:o}", fallbackUtc);
                 return fallbackUtc;
             }
         }
